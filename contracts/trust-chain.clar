@@ -340,3 +340,197 @@
     )
   )
 )
+
+;; REPUTATION MANAGEMENT
+
+;; Award reputation points for completing a verified action
+(define-public (update-reputation-score (action-type (string-ascii 50)))
+  (let (
+      (owner tx-sender)
+      (current-identity (unwrap! (map-get? identities { owner: owner })
+        (err ERR-IDENTITY-NOT-FOUND)
+      ))
+      (current-score (get reputation-score current-identity))
+      (action-multiplier (get-action-multiplier action-type))
+      (total-actions (+ (get total-actions current-identity) u1))
+    )
+    (begin
+      ;; Check contract is active
+      (asserts! (var-get contract-active) (err ERR-NOT-ACTIVE))
+      ;; Check identity is active
+      (asserts! (get active current-identity) (err ERR-UNAUTHORIZED))
+      ;; Validate action type exists and is active
+      (asserts!
+        (is-some (map-get? reputation-actions { action-type: action-type }))
+        (err ERR-INVALID-PARAMETERS)
+      )
+      (asserts! (is-action-active action-type) (err ERR-INVALID-PARAMETERS))
+      ;; Apply decay if needed before score update
+      (if (should-decay (get last-decay current-identity))
+        (decay-reputation-internal owner)
+        true
+      )
+      ;; Calculate new score with maximum cap enforcement
+      (let (
+          (updated-identity (unwrap! (map-get? identities { owner: owner })
+            (err ERR-IDENTITY-NOT-FOUND)
+          ))
+          (updated-current-score (get reputation-score updated-identity))
+          (new-score (if (< (+ updated-current-score action-multiplier) MAX-REPUTATION-SCORE)
+            (+ updated-current-score action-multiplier)
+            MAX-REPUTATION-SCORE
+          ))
+        )
+        (begin
+          ;; Update identity record with new score and metadata
+          (map-set identities { owner: owner }
+            (merge updated-identity {
+              reputation-score: new-score,
+              last-updated: stacks-block-height,
+              total-actions: total-actions,
+            })
+          )
+          ;; Create audit trail entry
+          (log-reputation-change owner action-type updated-current-score
+            new-score
+          )
+          (ok new-score)
+        )
+      )
+    )
+  )
+)
+
+;; Internal function to apply time-based reputation decay
+(define-private (decay-reputation-internal (owner principal))
+  (let (
+      (current-identity (default-to {
+        did: "",
+        reputation-score: u0,
+        created-at: u0,
+        last-updated: u0,
+        last-decay: u0,
+        total-actions: u0,
+        active: false,
+      }
+        (map-get? identities { owner: owner })
+      ))
+      (current-score (get reputation-score current-identity))
+      (decay-amount (/ (* current-score (var-get decay-rate)) u100))
+      (updated-score (if (> current-score decay-amount)
+        (- current-score decay-amount)
+        MIN-REPUTATION-SCORE
+      ))
+    )
+    (begin
+      (map-set identities { owner: owner }
+        (merge current-identity {
+          reputation-score: updated-score,
+          last-updated: stacks-block-height,
+          last-decay: stacks-block-height,
+        })
+      )
+      ;; Log the reputation decay event
+      (log-reputation-change owner "decay" current-score updated-score)
+      true
+    )
+  )
+)
+
+;; Manually trigger reputation decay for the calling identity
+(define-public (decay-reputation)
+  (let (
+      (owner tx-sender)
+      (current-identity (unwrap! (map-get? identities { owner: owner })
+        (err ERR-IDENTITY-NOT-FOUND)
+      ))
+    )
+    (begin
+      ;; Check contract is active
+      (asserts! (var-get contract-active) (err ERR-NOT-ACTIVE))
+      ;; Check identity is active
+      (asserts! (get active current-identity) (err ERR-UNAUTHORIZED))
+      ;; Validate decay period has passed
+      (asserts! (should-decay (get last-decay current-identity))
+        (err ERR-INVALID-PARAMETERS)
+      )
+      (decay-reputation-internal owner)
+      (let (
+          (updated-identity (unwrap! (map-get? identities { owner: owner })
+            (err ERR-IDENTITY-NOT-FOUND)
+          ))
+          (updated-score (get reputation-score updated-identity))
+        )
+        (ok updated-score)
+      )
+    )
+  )
+)
+
+;; READ-ONLY QUERY FUNCTIONS
+
+;; Get the current reputation score for a principal
+(define-read-only (get-reputation (owner principal))
+  (let ((identity (get-identity-field owner)))
+    (if (is-some identity)
+      (some (get reputation-score (unwrap! identity none)))
+      none
+    )
+  )
+)
+
+;; Get the complete identity profile for a principal
+(define-read-only (get-full-identity (owner principal))
+  (get-identity-field owner)
+)
+
+;; Verify if a principal meets minimum reputation requirements
+(define-read-only (verify-reputation
+    (owner principal)
+    (min-reputation-threshold uint)
+  )
+  (match (map-get? identities { owner: owner })
+    identity (if (and
+        (get active identity)
+        (>= (get reputation-score identity) min-reputation-threshold)
+      )
+      (some true)
+      none
+    )
+    none
+  )
+)
+
+;; Get configuration details for a specific reputation action
+(define-read-only (get-reputation-action (action-type (string-ascii 50)))
+  (map-get? reputation-actions { action-type: action-type })
+)
+
+;; Retrieve historical reputation change data
+(define-read-only (get-reputation-history
+    (owner principal)
+    (tx-id uint)
+  )
+  (map-get? reputation-history {
+    owner: owner,
+    tx-id: tx-id,
+  })
+)
+
+;; Get all current contract configuration parameters
+(define-read-only (get-contract-parameters)
+  {
+    max-reputation: MAX-REPUTATION-SCORE,
+    min-reputation: MIN-REPUTATION-SCORE,
+    starting-reputation: (var-get starting-reputation),
+    decay-rate: (var-get decay-rate),
+    decay-period: (var-get decay-period),
+    owner: (var-get contract-owner),
+    active: (var-get contract-active),
+  }
+)
+
+;; CONTRACT INITIALIZATION
+
+;; Bootstrap the contract with default reputation actions on deployment
+(initialize-reputation-actions)
